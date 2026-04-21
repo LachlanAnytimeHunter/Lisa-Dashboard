@@ -633,6 +633,29 @@
     .stat-grid { grid-template-columns: repeat(2, 1fr); }
   }
 
+  /* ── LOADING OVERLAY ── */
+  .loading-overlay {
+    position: fixed; inset: 0;
+    background: rgba(13,13,13,0.85);
+    display: flex; align-items: center; justify-content: center;
+    z-index: 9000; flex-direction: column; gap: 16px;
+    backdrop-filter: blur(4px);
+  }
+  .loading-overlay.hidden { display: none; }
+  .spinner {
+    width: 44px; height: 44px;
+    border: 3px solid rgba(107,45,139,0.3);
+    border-top-color: var(--af-orange);
+    border-radius: 50%;
+    animation: spin 0.8s linear infinite;
+  }
+  @keyframes spin { to { transform: rotate(360deg); } }
+  .loading-overlay p {
+    font-family: 'Barlow Condensed', sans-serif;
+    font-size: 14px; letter-spacing: 2px;
+    text-transform: uppercase; color: var(--af-grey-mid);
+  }
+
   /* scrollbar */
   ::-webkit-scrollbar { width: 6px; height: 6px; }
   ::-webkit-scrollbar-track { background: var(--af-dark); }
@@ -657,6 +680,11 @@
     <button class="nav-tab" onclick="showPage('howto')">How To Use</button>
   </div>
 </nav>
+
+<div id="loading-overlay" class="loading-overlay">
+  <div class="spinner"></div>
+  <p>Loading dashboard data…</p>
+</div>
 
 <div id="toast" class="toast">✓ Data saved</div>
 
@@ -891,15 +919,91 @@ function getDisplayMonths() {
   return months;
 }
 
-// Storage key: data[year][month][clubId] = array of row objects
-let DATA = {};
-function loadData() {
-  try { DATA = JSON.parse(localStorage.getItem('af_dashboard') || '{}'); } catch(e) { DATA = {}; }
+// ══════════════════════════════════════════════════════════════════════════
+// SUPABASE CONFIG
+// ══════════════════════════════════════════════════════════════════════════
+const SUPABASE_URL = 'https://vylbamwozvfugeumtefj.supabase.co';
+const SUPABASE_KEY = 'sb_publishable_UQsSlJ53kB2Xsk0R3SxKgw_9dwLSFft';
+const SB_HEADERS = {
+  'Content-Type': 'application/json',
+  'apikey': SUPABASE_KEY,
+  'Authorization': `Bearer ${SUPABASE_KEY}`
+};
+
+async function sbFetch(path, opts = {}) {
+  const res = await fetch(SUPABASE_URL + path, {
+    ...opts,
+    headers: { ...SB_HEADERS, ...(opts.headers || {}) }
+  });
+  if (!res.ok) {
+    const err = await res.text();
+    throw new Error(`Supabase error: ${res.status} ${err}`);
+  }
+  return res.status === 204 ? null : res.json();
 }
-function saveData() {
-  localStorage.setItem('af_dashboard', JSON.stringify(DATA));
-  showToast('Data saved');
-  updateAllCharts();
+
+// Storage: data[year][month][clubId] = array of row objects
+let DATA = {};
+
+async function loadData() {
+  showLoadingOverlay(true);
+  try {
+    const rows = await sbFetch('/rest/v1/dashboard_entries?select=*&order=year,month,club_id,row_index');
+    DATA = {};
+    (rows || []).forEach(r => {
+      if (!DATA[r.year]) DATA[r.year] = {};
+      if (!DATA[r.year][r.month]) DATA[r.year][r.month] = {};
+      if (!DATA[r.year][r.month][r.club_id]) DATA[r.year][r.month][r.club_id] = [];
+      DATA[r.year][r.month][r.club_id][r.row_index] = {
+        date: r.date, hours: r.hours ?? '', retention: r.retention ?? '',
+        member: r.member ?? '', arrears_calls: r.arrears_calls ?? '',
+        arrears_amt: r.arrears_amt ?? '', notes: r.notes ?? '',
+        _db_id: r.id
+      };
+    });
+  } catch(e) {
+    console.error('Load error:', e);
+    showToast('⚠ Could not load data — check Supabase setup');
+  }
+  showLoadingOverlay(false);
+}
+
+async function saveData() {
+  // No-op here — saving is done per-club via saveClub()
+}
+
+async function saveClubToSupabase(year, month, clubId) {
+  const rows = getRows(year, month, clubId);
+  showToast('Saving…');
+  try {
+    // Delete existing rows for this club/month/year
+    await sbFetch(`/rest/v1/dashboard_entries?year=eq.${year}&month=eq.${month}&club_id=eq.${clubId}`, {
+      method: 'DELETE'
+    });
+    // Insert all current rows
+    if (rows.length > 0) {
+      const payload = rows.map((row, ri) => ({
+        year: parseInt(year), month: parseInt(month), club_id: parseInt(clubId),
+        row_index: ri,
+        date: row.date || null,
+        hours: row.hours !== '' ? parseFloat(row.hours) : null,
+        retention: row.retention !== '' ? parseInt(row.retention) : null,
+        member: row.member !== '' ? parseInt(row.member) : null,
+        arrears_calls: row.arrears_calls !== '' ? parseInt(row.arrears_calls) : null,
+        arrears_amt: row.arrears_amt !== '' ? parseFloat(row.arrears_amt) : null,
+        notes: row.notes || null
+      }));
+      await sbFetch('/rest/v1/dashboard_entries', {
+        method: 'POST',
+        body: JSON.stringify(payload)
+      });
+    }
+    showToast('Data saved ✓');
+    updateAllCharts();
+  } catch(e) {
+    console.error('Save error:', e);
+    showToast('⚠ Save failed — see console');
+  }
 }
 function ensurePath(year, month, clubId) {
   if (!DATA[year]) DATA[year] = {};
@@ -1121,7 +1225,7 @@ function deleteRow(year, month, clubId, ri) {
 }
 
 function saveClub(year, month, clubId) {
-  saveData();
+  saveClubToSupabase(year, month, clubId);
   refreshFooter(year, month, clubId);
 }
 
@@ -1293,6 +1397,10 @@ function showPage(page) {
   if (page === 'overview' || page === 'totals') setTimeout(updateAllCharts, 50);
 }
 
+function showLoadingOverlay(show) {
+  document.getElementById('loading-overlay').classList.toggle('hidden', !show);
+}
+
 // ══════════════════════════════════════════════════════════════════════════
 // TOAST
 // ══════════════════════════════════════════════════════════════════════════
@@ -1318,16 +1426,17 @@ function hexToRgb(hex) {
 // ══════════════════════════════════════════════════════════════════════════
 // INIT
 // ══════════════════════════════════════════════════════════════════════════
-loadData();
-buildMonthlyUI();
-updateAllCharts();
-
-// Refresh footers for loaded data
-getDisplayMonths().forEach(dm => {
-  CLUBS.forEach(club => {
-    setTimeout(() => refreshFooter(dm.year, dm.month, club.id), 100);
+(async () => {
+  await loadData();
+  buildMonthlyUI();
+  updateAllCharts();
+  // Refresh footers for loaded data
+  getDisplayMonths().forEach(dm => {
+    CLUBS.forEach(club => {
+      setTimeout(() => refreshFooter(dm.year, dm.month, club.id), 100);
+    });
   });
-});
+})();
 </script>
 </body>
 </html>
